@@ -48,8 +48,12 @@ jobs:
       - name: create ds3615xs 7.0.1 image
         run: |
           ./redpill_tool_chain.sh auto bromolow-7.0.1-42218
+          
+      - name: covnert img to vmdk
+        run: |
+          qemu-img convert -f raw -O vmdk images/*.img images/ds3615.vmdk
 
       - uses: actions/upload-artifact@v2
         with:
           name: images
-          path: images/*.img
+          path: images/*.vmdk
