@@ -3,7 +3,7 @@ set -eu
 
 function checkPreconditon(){
     missing_tools=""
-    for tool in jq docker realpath sha256sum; do
+    for tool in jq curl docker realpath sha256sum; do
         if [ ! $(which ${tool} ) ];then
             missing_tools+=" ${tool}"
         fi
@@ -16,13 +16,17 @@ function checkPreconditon(){
 checkPreconditon
 
 function readConfig() {
-    cat global_config.json
+    if [ ! -e custom_config.json ]; then
+        cat global_config.json
+    else
+        jq -s '.[0].docker=(.[0].docker * .[1].docker) |.[0].build_configs=(.[1].build_configs + .[0].build_configs | unique_by(.id)) | .[0]' global_config.json custom_config.json
+    fi
 }
 
 function getValueByJsonPath(){
     local JSONPATH=${1}
     local CONFIG=${2}
-    jq -r "${JSONPATH}" <<<${CONFIG}
+    jq -c -r "${JSONPATH}" <<<${CONFIG}
 }
 
 function buildImage(){
@@ -53,6 +57,7 @@ function clean(){
     if [ "${AUTO_CLEAN}" != "true" ]; then
         echo "---------- before clean --------------------------------------"
         docker system df
+        echo "---------- before clean --------------------------------------"
     fi
     if [ "${ID}" == "all" ];then
         OLD_IMAGES=$(docker image ls --filter label=redpill-tool-chain --quiet $( [ "${CLEAN_IMAGES}" == "orphaned" ] && echo "--filter dangling=true"))
@@ -67,13 +72,19 @@ function clean(){
     if [ "${AUTO_CLEAN}" != "true" ]; then
         echo "---------- after clean ---------------------------------------"
         docker system df
+        echo "---------- after clean ---------------------------------------"
     fi
 }
 
 function runContainer(){
     local CMD=${1}
+    local SCRIPTNAME=${2:-""}
+    local PLATFORM_VERSION=${3:-""}
+    # only shift args for ext.
+    [ $# -gt 3 ] && shift 3
+    local CMD_ARGS=${@:-""}
     if [ ! -e $(realpath "${USER_CONFIG_JSON}") ]; then
-        echo "user config does not exist: ${USER_CONFIG_JSON}"
+        echo "User config does not exist: ${USER_CONFIG_JSON}"
         exit 1
     fi
     if [[ "${LOCAL_RP_LKM_USE}" == "true" && ! -e $(realpath "${LOCAL_RP_LKM_PATH}") ]]; then
@@ -93,19 +104,20 @@ function runContainer(){
                 echo "Host path does not exist: ${HOST_PATH}"
                 exit 1
             fi
-            BINDS+="--volume $(realpath ${HOST_PATH}):${CONTAINER_PATH} "
+            BINDS+="--volume $(realpath "${HOST_PATH}"):${CONTAINER_PATH} "
         done
     fi
-    docker run --privileged --rm  $( [ "${CMD}" == "run" ] && echo " --interactive") --tty \
-        --name redpill-tool-chain \
-        --hostname redpill-tool-chain \
+    docker run --privileged --rm  $( [ "${CMD}" == "run" ] || [ "${CMD}" == "ext" ] && echo " --interactive") --tty \
+        --name rp-helper \
+        --hostname rp-helper \
         --volume /dev:/dev \
         $( [ "${USE_CUSTOM_BIND_MOUNTS}" == "true" ] && echo "${BINDS}") \
-        $( [ "${LOCAL_RP_LOAD_USE}" == "true" ] && echo "--volume $(realpath ${LOCAL_RP_LOAD_PATH}):/opt/redpill-load") \
-        $( [ "${LOCAL_RP_LKM_USE}" == "true" ] && echo "--volume $(realpath ${LOCAL_RP_LKM_PATH}):/opt/redpill-lkm") \
-        $( [ -e "${USER_CONFIG_JSON}" ] && echo "--volume $(realpath ${USER_CONFIG_JSON}):/opt/redpill-load/user_config.json") \
+        $( [ "${LOCAL_RP_LOAD_USE}" == "true" ] && echo "--volume $(realpath "${LOCAL_RP_LOAD_PATH}"):/opt/redpill-load") \
+        $( [ "${LOCAL_RP_LKM_USE}" == "true" ] && echo "--volume $(realpath "${LOCAL_RP_LKM_PATH}"):/opt/redpill-lkm") \
+        $( [ -e "${USER_CONFIG_JSON}" ] && echo "--volume $(realpath "${USER_CONFIG_JSON}"):/opt/redpill-load/user_config.json") \
         --volume ${REDPILL_LOAD_CACHE}:/opt/redpill-load/cache \
         --volume ${REDPILL_LOAD_IMAGES}:/opt/redpill-load/images \
+        --volume ${REDPILL_LOAD_CUSTOM}:/opt/redpill-load/custom \
         --env REDPILL_LKM_MAKE_TARGET=${REDPILL_LKM_MAKE_TARGET} \
         --env TARGET_PLATFORM="${TARGET_PLATFORM}" \
         --env TARGET_VERSION="${TARGET_VERSION}" \
@@ -113,7 +125,7 @@ function runContainer(){
         --env REVISION="${TARGET_REVISION}" \
         --env LOCAL_RP_LKM_USE="${LOCAL_RP_LKM_USE}" \
         --env LOCAL_RP_LOAD_USE="${LOCAL_RP_LOAD_USE}" \
-        ${DOCKER_IMAGE_NAME}:${TARGET_PLATFORM}-${TARGET_VERSION}-${TARGET_REVISION} $( [ "${CMD}" == "run" ] && echo "/bin/bash")
+        ${DOCKER_IMAGE_NAME}:${TARGET_PLATFORM}-${TARGET_VERSION}-${TARGET_REVISION} "${CMD}" "${SCRIPTNAME}" "${PLATFORM_VERSION}" "${CMD_ARGS}"
 }
 
 function downloadFromUrlIfNotExists(){
@@ -141,30 +153,42 @@ function checkFileSHA256Checksum(){
 
 function showHelp(){
 cat << EOF
-Usage: ${0} <action> <platform version>
+$(basename ${0}) v${RP_HELPER_VERS}
 
-Actions: build, auto, run, clean
+Usage: ${0} <action> <build_config_id> [extension manager arguments]
 
-- build:    Build the toolchain image for the specified platform version.
+Actions: build, ext, auto, run, clean
 
-- auto:     Starts the toolchain container using the previosuly build toolchain image for the specified platform.
-            Updates redpill sources and builds the bootloader image automaticaly. Will end the container once done.
+- build:    Build the redpill-helper image for the specified build config id
 
-- run:      Starts the toolchain container using the previously built toolchain image for the specified platform.
-            Interactive Bash terminal.
+- ext:      Manage extensions within the specified build config id container.
+            The modifications will apply to all build configs!
 
-- clean:    Removes old (=dangling) images and the build cache for a platform version.
-            Use `all` as platform version to remove images and build caches for all platform versions.
+- auto:     Starts the redpill-helper container using the previously built 
+            redpill-helper image for the specified buid config id. Updates 
+            redpill sources and builds the bootloader image automaticaly and
+            end the container once done
 
-Available platform versions:
+- run:      Starts the redpill-helper container using the previously built 
+            redpill-helper image for the specified build config id with
+            an interactive bash terminal
+
+- clean:    Removes old/dangling images and the build cache for a given 
+            build config id. Use "all" as build config id to remove images and
+            build caches for all build configs.
+            NB "docker.clean_images": "all" only affects "clean all"
+
+Available build config ids:
 ---------------------
 ${AVAILABLE_IDS}
 
-Check global_settings.json for settings.
+NB. by default, only build config ids supported by TTG are listed. Others can 
+be added in the "custom_config.json".
 EOF
 }
 
 
+RP_HELPER_VERS="0.12"
 
 # mount-bind host folder with absolute path into redpill-load cache folder
 # will not work with relativfe path! If single name is used, a docker volume will be created!
@@ -172,6 +196,10 @@ REDPILL_LOAD_CACHE=${PWD}/cache
 
 # mount bind hots folder with absolute path into redpill load images folder
 REDPILL_LOAD_IMAGES=${PWD}/images
+
+# mount bind hots folder with absolute path into redpill load images folder
+REDPILL_LOAD_CUSTOM=${PWD}/custom
+
 
 
 ####################################################
@@ -198,7 +226,7 @@ ID=${2}
 if [ "${ID}" != "all"  ]; then
     BUILD_CONFIG=$(getValueByJsonPath ".build_configs[] | select(.id==\"${ID}\")" "${CONFIG}")
     if [ -z "${BUILD_CONFIG}" ];then
-        echo "Error: Platform version ${ID} not specified in global_config.json"
+        echo "Error: build config id ${ID} does not exist in global_config.json (or custom_config.json)"
         echo
         showHelp
         exit 1
@@ -228,7 +256,6 @@ if [ "${ID}" != "all"  ]; then
     REDPILL_LKM_BRANCH=$(getValueByJsonPath ".redpill_lkm.branch" "${BUILD_CONFIG}")
     REDPILL_LOAD_REPO=$(getValueByJsonPath ".redpill_load.source_url" "${BUILD_CONFIG}")
     REDPILL_LOAD_BRANCH=$(getValueByJsonPath ".redpill_load.branch" "${BUILD_CONFIG}")
-
     EXTRACTED_KSRC='/linux*'
     if [ "${COMPILE_WITH}" == "toolkit_dev" ]; then
         EXTRACTED_KSRC="/usr/local/x86_64-pc-linux-gnu/x86_64-pc-linux-gnu/sys-root/usr/lib/modules/DSM-${DSM_VERSION}/build/"
@@ -250,6 +277,9 @@ case "${ACTION}" in
             if [ "${AUTO_CLEAN}" == "true" ]; then
                 clean
             fi
+            ;;
+    ext)    shift
+            runContainer "ext" "${0}" $@
             ;;
     run)    runContainer "run"
             ;;
